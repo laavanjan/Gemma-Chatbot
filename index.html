@@ -157,33 +157,7 @@
                 removeElement(typingId);
 
                 if (!response.ok) {
-                    const errorText = await response.text();
-                    let errorMessage = "Failed to fetch response from Hugging Face.";
-
-                    try {
-                        const err = JSON.parse(errorText);
-                        const apiError = err.error ?? err.message;
-
-                        if (typeof apiError === "string") {
-                            errorMessage = apiError;
-                        } else if (apiError?.message) {
-                            errorMessage = apiError.message;
-                        } else if (apiError) {
-                            errorMessage = JSON.stringify(apiError);
-                        }
-                    } catch {
-                        if (errorText) {
-                            errorMessage = errorText;
-                        }
-                    }
-
-                    if (response.status === 401 || /invalid username or password/i.test(errorMessage)) {
-                        errorMessage = "Your Hugging Face token is invalid or does not have Inference Providers access. Create a fine-grained token with 'Make calls to Inference Providers' enabled, then paste that token here.";
-                    } else if (response.status === 403) {
-                        errorMessage = "Your Hugging Face token was accepted, but it does not have permission to call Inference Providers for this model.";
-                    }
-
-                    throw new Error(errorMessage);
+                    throw await buildHuggingFaceError(response, modelId);
                 }
 
                 const result = await response.json();
@@ -192,9 +166,9 @@
                 const generatedText = choice?.message?.content?.trim();
                 if (!generatedText) {
                     if (choice?.finish_reason === "length") {
-                        throw new Error("The model used the full response-token limit before producing an answer. Please try again with a shorter prompt.");
+                        throw new ChatbotError("Response was cut off", "The model reached the response limit before it could finish. Try a shorter question or ask for a shorter answer.");
                     }
-                    throw new Error("Unexpected response format from API.");
+                    throw new ChatbotError("Unexpected API response", "Hugging Face returned a response, but it did not contain a readable assistant message. Try another model/provider from the dropdown.");
                 }
 
                 // 5. Append Model Response to UI
@@ -203,16 +177,130 @@
 
             } catch (error) {
                 removeElement(typingId);
-                const isNetworkFailure = error instanceof TypeError && error.message === 'Failed to fetch';
-                const suffix = isNetworkFailure
-                    ? ' Check that the token has Inference Providers access and that the page is being served from a browser context that allows cross-origin requests.'
-                    : '';
-                appendMessage('error', `Error: ${error.message}.${suffix}`);
+                appendMessage('error', formatErrorForDisplay(error));
                 // Remove failed user message from history
                 conversationHistory.pop(); 
             }
 
             scrollToBottom();
+        }
+
+        class ChatbotError extends Error {
+            constructor(title, message, details = "") {
+                super(message);
+                this.name = "ChatbotError";
+                this.title = title;
+                this.details = details;
+            }
+        }
+
+        async function buildHuggingFaceError(response, modelId) {
+            const rawText = await response.text();
+            const apiMessage = extractApiErrorMessage(rawText);
+            const status = response.status;
+
+            if (status === 401 || /invalid username|invalid token|unauthorized|authentication/i.test(apiMessage)) {
+                return new ChatbotError(
+                    "Invalid Hugging Face token",
+                    "Your token is missing, expired, or does not have Inference Providers access.",
+                    "Create a Hugging Face token with inference/provider access, paste it again, then retry."
+                );
+            }
+
+            if (status === 402 || /credit|billing|payment|quota/i.test(apiMessage)) {
+                return new ChatbotError(
+                    "Free credits or billing limit reached",
+                    "Hugging Face could not run this request because your available inference credits may be finished.",
+                    "Try a cheaper/free provider model, wait for credits to reset, or add billing credits in Hugging Face."
+                );
+            }
+
+            if (status === 403 || /permission|gated|access|not authorized/i.test(apiMessage)) {
+                return new ChatbotError(
+                    "Model access denied",
+                    `Your token works, but it does not have permission to use ${modelId}.`,
+                    "If the model is gated, open its Hugging Face model page, accept the license/access request, then try again."
+                );
+            }
+
+            if (status === 404 || /not supported by any provider|provider|not found|does not exist/i.test(apiMessage)) {
+                return new ChatbotError(
+                    "Model/provider not available",
+                    `${modelId} is not available through your enabled Hugging Face Inference Provider right now.`,
+                    "Choose another model from the dropdown or use the exact provider suffix shown on Hugging Face, for example model-name:provider-name."
+                );
+            }
+
+            if (status === 429 || /rate limit|too many requests|temporarily overloaded/i.test(apiMessage)) {
+                return new ChatbotError(
+                    "Too many requests",
+                    "The provider is rate-limiting requests at the moment.",
+                    "Wait a minute and try again, or switch to another provider/model."
+                );
+            }
+
+            if (status === 500 || status === 502 || status === 503 || status === 504 || /loading|cold start|unavailable|timeout/i.test(apiMessage)) {
+                return new ChatbotError(
+                    "Provider is temporarily unavailable",
+                    "The model/provider may be loading, busy, or temporarily down.",
+                    "Wait 1-2 minutes and retry. If it keeps happening, choose another model/provider."
+                );
+            }
+
+            return new ChatbotError(
+                `Hugging Face API error (${status})`,
+                apiMessage || "The request failed, but Hugging Face did not return a clear error message.",
+                rawText && rawText !== apiMessage ? rawText : ""
+            );
+        }
+
+        function extractApiErrorMessage(rawText) {
+            if (!rawText) return "";
+
+            try {
+                const parsed = JSON.parse(rawText);
+                const apiError = parsed.error ?? parsed.message ?? parsed.detail;
+
+                if (typeof apiError === "string") return apiError;
+                if (apiError?.message) return apiError.message;
+                if (Array.isArray(apiError)) return apiError.map(item => item?.msg || item?.message || JSON.stringify(item)).join("\n");
+                if (apiError) return JSON.stringify(apiError);
+
+                return JSON.stringify(parsed);
+            } catch {
+                return rawText;
+            }
+        }
+
+        function formatErrorForDisplay(error) {
+            if (error instanceof TypeError && /failed to fetch|networkerror/i.test(error.message)) {
+                return [
+                    "Network error",
+                    "",
+                    "The browser could not reach Hugging Face.",
+                    "",
+                    "Try these:",
+                    "- Check your internet connection.",
+                    "- Turn off VPN/proxy temporarily.",
+                    "- If you opened the file directly, try hosting it with GitHub Pages or Hugging Face Spaces.",
+                    "- Confirm your browser is not blocking requests to router.huggingface.co."
+                ].join("\n");
+            }
+
+            if (error instanceof ChatbotError) {
+                return [
+                    error.title,
+                    "",
+                    error.message,
+                    error.details ? `\nWhat to do:\n- ${error.details}` : ""
+                ].join("\n").trim();
+            }
+
+            return [
+                "Something went wrong",
+                "",
+                error?.message || "Unknown error. Please try again."
+            ].join("\n");
         }
 
         // Helper UI Functions
